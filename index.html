@@ -1,0 +1,300 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="chrome=1">
+    <title>Sky9 by wangfakang</title>
+
+    <link rel="stylesheet" href="stylesheets/styles.css">
+    <link rel="stylesheet" href="stylesheets/github-light.css">
+    <script src="javascripts/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+  </head>
+  <body>
+    <div class="wrapper">
+      <header>
+        <h1 class="header">Sky9</h1>
+        <p class="header">balancer_by_lua  analysis</p>
+
+        <ul>
+          <li class="download"><a class="buttons" href="https://github.com/wangfakang/sky9/zipball/master">Download ZIP</a></li>
+          <li class="download"><a class="buttons" href="https://github.com/wangfakang/sky9/tarball/master">Download TAR</a></li>
+          <li><a class="buttons github" href="https://github.com/wangfakang/sky9">View On GitHub</a></li>
+        </ul>
+
+        <p class="header">This project is maintained by <a class="header name" href="https://github.com/wangfakang">wangfakang</a></p>
+
+
+      </header>
+      <section>
+        <p><code>balancer_by_lua的开发</code></p>
+
+<p>该模块基本思想：<br>
+　　就是完全绕过了之前的upstream，自己设置相应的回调  </p>
+
+<p>该模块的运用：<br>
+　　动态管理nginx的upstream方案如下：<br>
+　　这里我感觉玩法还是蛮多的，其一就是把相应的后端server信息进行存放在第三方库中[redis等],然后相应
+的信息加载到share memory进行缓存，然后可以在location中为每一个请求进行设置当前请求的server信息
+［可以记录在ngx.ctx中］，然后在balancer_by_lua中进行读取ngx.ctx进行调用set_current_peer进行相
+应的后端server的路由．    </p>
+
+<p>下面就相应的源码进行简单解析下：      </p>
+
+<p>这是其balancer的路由数据结构：   </p>
+
+<div class="highlight highlight-source-c"><pre>+<span class="pl-k">typedef</span> <span class="pl-k">struct</span> {
++    <span class="pl-c">/* the round robin data must be first */</span>
++    <span class="pl-c1">ngx_http_upstream_rr_peer_data_t</span>    rrp;<span class="pl-c">//复用了round_robin的数据结构，当后面没有设置sockaddr的时候就会调用round_robin进行路由</span>
++
++    <span class="pl-c1">ngx_http_lua_srv_conf_t</span>            *conf;
++    <span class="pl-c1">ngx_http_request_t</span>                 *request;
++
++    ngx_event_get_peer_pt               get_rr_peer;
++
++    <span class="pl-c1">ngx_uint_t</span>                          more_tries;
++    <span class="pl-c1">ngx_uint_t</span>                          total_tries;<span class="pl-c">//当前总的重试次数</span>
++
++    <span class="pl-k">struct</span> sockaddr                    *sockaddr;
++    <span class="pl-c1">socklen_t</span>                           socklen;
++
++    <span class="pl-c1">ngx_str_t</span>                           host;
++    <span class="pl-c1">in_port_t</span>                           port;
++
++    <span class="pl-k">int</span>                                 last_peer_state;
++} <span class="pl-c1">ngx_http_lua_balancer_peer_data_t</span>;
++</pre></div>
+
+<div class="highlight highlight-source-c"><pre>balancer_by_lua的初始化函数．在配置文件解析的时候执行
+<span class="pl-k">char</span> *
++ngx_http_lua_balancer_by_lua(<span class="pl-c1">ngx_conf_t</span> *cf, <span class="pl-c1">ngx_command_t</span> *cmd,
++    <span class="pl-k">void</span> *conf)
++{
++ ．．．．．．．．．
++    value = cf-&gt;args-&gt;elts;
++
++    lscf-&gt;balancer.<span class="pl-smi">handler</span> = (ngx_http_lua_srv_conf_handler_pt) cmd-&gt;post;
++
++    <span class="pl-k">if</span> (cmd-&gt;post == ngx_http_lua_balancer_handler_file) {
++        <span class="pl-c">/* Lua code in an external file */</span>
++
++        name = <span class="pl-c1">ngx_http_lua_rebase_path</span>(cf-&gt;pool, value[<span class="pl-c1">1</span>].<span class="pl-smi">data</span>,
++                                        value[<span class="pl-c1">1</span>].<span class="pl-smi">len</span>);
++        <span class="pl-k">if</span> (name == <span class="pl-c1">NULL</span>) {
++            <span class="pl-k">return</span> NGX_CONF_ERROR;
++        }
++
++        lscf-&gt;balancer.<span class="pl-smi">src</span>.<span class="pl-smi">data</span> = name;
++        lscf-&gt;balancer.<span class="pl-smi">src</span>.<span class="pl-smi">len</span> = <span class="pl-c1">ngx_strlen</span>(name);
++
++        p = <span class="pl-c1">ngx_palloc</span>(cf-&gt;pool, NGX_HTTP_LUA_FILE_KEY_LEN + <span class="pl-c1">1</span>);
++        <span class="pl-k">if</span> (p == <span class="pl-c1">NULL</span>) {
++            <span class="pl-k">return</span> NGX_CONF_ERROR;
++        }
++
++        lscf-&gt;balancer.<span class="pl-smi">src_key</span> = p;
++
++        p = <span class="pl-c1">ngx_copy</span>(p, NGX_HTTP_LUA_FILE_TAG, NGX_HTTP_LUA_FILE_TAG_LEN);
++        p = <span class="pl-c1">ngx_http_lua_digest_hex</span>(p, value[<span class="pl-c1">1</span>].<span class="pl-smi">data</span>, value[<span class="pl-c1">1</span>].<span class="pl-smi">len</span>);
++        *p = <span class="pl-s"><span class="pl-pds">'</span><span class="pl-cce">\0</span><span class="pl-pds">'</span></span>;
++
++    } <span class="pl-k">else</span> {
++        <span class="pl-c">/* inlined Lua code */</span>
++
++        lscf-&gt;balancer.<span class="pl-smi">src</span> = value[<span class="pl-c1">1</span>];
++
++        p = <span class="pl-c1">ngx_palloc</span>(cf-&gt;pool, NGX_HTTP_LUA_INLINE_KEY_LEN + <span class="pl-c1">1</span>);
++        <span class="pl-k">if</span> (p == <span class="pl-c1">NULL</span>) {
++            <span class="pl-k">return</span> NGX_CONF_ERROR;
++        }
++
++        lscf-&gt;balancer.<span class="pl-smi">src_key</span> = p;
++
++        p = <span class="pl-c1">ngx_copy</span>(p, NGX_HTTP_LUA_INLINE_TAG, NGX_HTTP_LUA_INLINE_TAG_LEN);
++        p = <span class="pl-c1">ngx_http_lua_digest_hex</span>(p, value[<span class="pl-c1">1</span>].<span class="pl-smi">data</span>, value[<span class="pl-c1">1</span>].<span class="pl-smi">len</span>);
++        *p = <span class="pl-s"><span class="pl-pds">'</span><span class="pl-cce">\0</span><span class="pl-pds">'</span></span>;
++    }
++
++    uscf = <span class="pl-c1">ngx_http_conf_get_module_srv_conf</span>(cf, ngx_http_upstream_module);
++
++    <span class="pl-k">if</span> (uscf-&gt;peer.<span class="pl-smi">init_upstream</span>) {
++        <span class="pl-c1">ngx_conf_log_error</span>(NGX_LOG_WARN, cf, <span class="pl-c1">0</span>,
++                           <span class="pl-s"><span class="pl-pds">"</span>load balancing method redefined<span class="pl-pds">"</span></span>);
++    }
++　　　　<span class="pl-c">//主要就是这个回调的设置　这个主要就是在init_upstream的时候进行判断　然后进行执行［解析upstream模块的时候］</span>
++    uscf-&gt;peer.<span class="pl-smi">init_upstream</span> = ngx_http_lua_balancer_init;
++
++    uscf-&gt;flags = NGX_HTTP_UPSTREAM_CREATE
++                  |NGX_HTTP_UPSTREAM_WEIGHT
++                  |NGX_HTTP_UPSTREAM_MAX_FAILS
++                  |NGX_HTTP_UPSTREAM_FAIL_TIMEOUT
++                  |NGX_HTTP_UPSTREAM_DOWN;
++
++    <span class="pl-k">return</span> NGX_CONF_OK;
++}
++</pre></div>
+
+<p>在配置文件解析饿时候执行，也就是上面设置饿回调［upstream解析的时候］</p>
+
+<div class="highlight highlight-source-c"><pre><span class="pl-k">static</span> <span class="pl-c1">ngx_int_t</span>
++ngx_http_lua_balancer_init(<span class="pl-c1">ngx_conf_t</span> *cf,
++    <span class="pl-c1">ngx_http_upstream_srv_conf_t</span> *us)
++{
++    <span class="pl-k">if</span> (<span class="pl-c1">ngx_http_upstream_init_round_robin</span>(cf, us) != NGX_OK) {
++        <span class="pl-k">return</span> NGX_ERROR;
++    }
++
++    <span class="pl-c">/* this callback is called upon individual requests */</span>
++    us-&gt;peer.<span class="pl-smi">init</span> = ngx_http_lua_balancer_init_peer;<span class="pl-c">//每一个请求的初始化函数</span>
++
++    <span class="pl-k">return</span> NGX_OK;
++}</pre></div>
+
+<p>每一个请求都会执行的，主要就是设置相应的回调    </p>
+
+<div class="highlight highlight-source-c"><pre>+<span class="pl-k">static</span> <span class="pl-c1">ngx_int_t</span>
++ngx_http_lua_balancer_init_peer(<span class="pl-c1">ngx_http_request_t</span> *r,
++    <span class="pl-c1">ngx_http_upstream_srv_conf_t</span> *us)
++{
++    <span class="pl-c1">ngx_http_lua_srv_conf_t</span>            *bcf;
++    <span class="pl-c1">ngx_http_lua_balancer_peer_data_t</span>  *bp;
++　　　　<span class="pl-c">//给自己的轮子造空间</span>
++    bp = <span class="pl-c1">ngx_pcalloc</span>(r-&gt;pool, <span class="pl-k">sizeof</span>(<span class="pl-c1">ngx_http_lua_balancer_peer_data_t</span>));
++    <span class="pl-k">if</span> (bp == <span class="pl-c1">NULL</span>) {
++        <span class="pl-k">return</span> NGX_ERROR;
++    }
++
++    r-&gt;upstream-&gt;peer.<span class="pl-smi">data</span> = &amp;bp-&gt;rrp;
++
++    <span class="pl-k">if</span> (<span class="pl-c1">ngx_http_upstream_init_round_robin_peer</span>(r, us) != NGX_OK) {<span class="pl-c">//默认的round_robin的初始化</span>
++        <span class="pl-k">return</span> NGX_ERROR;
++    }
++
++    r-&gt;upstream-&gt;peer.<span class="pl-smi">get</span> = ngx_http_lua_balancer_get_peer;<span class="pl-c">//设置每一个请求获取后端server的方法</span>
++    r-&gt;upstream-&gt;peer.<span class="pl-smi">free</span> = ngx_http_lua_balancer_free_peer;<span class="pl-c">//设置每一个请求获取后端server执行玩的方法</span>
++
++    bcf = <span class="pl-c1">ngx_http_conf_upstream_srv_conf</span>(us, ngx_http_lua_module);
++
++    bp-&gt;conf = bcf;
++    bp-&gt;get_rr_peer = ngx_http_upstream_get_round_robin_peer;/默认的round_robin方式获取
++    bp-&gt;request = r;
++
++    <span class="pl-k">return</span> NGX_OK;
++}
++</pre></div>
+
+<p>这个函数就是每个请求的回调钩子－－－如何获取后端的server   </p>
+
+<div class="highlight highlight-source-c"><pre><span class="pl-k">static</span> <span class="pl-c1">ngx_int_t</span>
++ngx_http_lua_balancer_get_peer(<span class="pl-c1">ngx_peer_connection_t</span> *pc, <span class="pl-k">void</span> *data)
++{
++    lua_State                          *L;
++    <span class="pl-c1">ngx_int_t</span>                           rc;
++    <span class="pl-c1">ngx_http_request_t</span>                 *r;
++    <span class="pl-c1">ngx_http_lua_ctx_t</span>                 *ctx;
++    <span class="pl-c1">ngx_http_lua_srv_conf_t</span>            *lscf;
++    <span class="pl-c1">ngx_http_lua_balancer_peer_data_t</span>  *bp = data;
++
++    <span class="pl-c1">ngx_log_debug1</span>(NGX_LOG_DEBUG_HTTP, pc-&gt;<span class="pl-c1">log</span>, <span class="pl-c1">0</span>,
++                   <span class="pl-s"><span class="pl-pds">"</span>lua balancer peer, try: <span class="pl-c1">%u</span>i<span class="pl-pds">"</span></span>, pc-&gt;tries);
++
++    lscf = bp-&gt;conf;
++
++    r = bp-&gt;request;
++
++    <span class="pl-c1">ngx_http_lua_assert</span>(lscf-&gt;balancer.<span class="pl-smi">handler</span> &amp;&amp; r);
++
++    L = <span class="pl-c1">ngx_http_lua_get_lua_vm</span>(r, <span class="pl-c1">NULL</span>);
++
++    bp-&gt;sockaddr = <span class="pl-c1">NULL</span>;
++    bp-&gt;socklen = <span class="pl-c1">0</span>;
++    bp-&gt;more_tries = <span class="pl-c1">0</span>;
++    bp-&gt;total_tries++;
++
++    rc = lscf-&gt;balancer.<span class="pl-c1">handler</span>(r, lscf, L);
++
++    <span class="pl-k">if</span> (rc == NGX_ERROR) {
++        <span class="pl-k">return</span> NGX_ERROR;
++    }
++
++    ctx = <span class="pl-c1">ngx_http_get_module_ctx</span>(r, ngx_http_lua_module);
++
++    <span class="pl-k">if</span> (ctx-&gt;exited &amp;&amp; ctx-&gt;exit_code != NGX_OK) {
++        rc = ctx-&gt;exit_code;
++        <span class="pl-k">if</span> (rc == NGX_ERROR || rc == NGX_BUSY || rc == NGX_DECLINED) {
++            <span class="pl-k">return</span> rc;
++        }
++
++        <span class="pl-k">if</span> (rc &gt; NGX_OK) {
++            <span class="pl-k">return</span> NGX_ERROR;
++        }
++    }
++
++    <span class="pl-k">if</span> (bp-&gt;sockaddr &amp;&amp; bp-&gt;socklen) { <span class="pl-c">//如果设置了［执行了set_current_peer］就会直接选择</span>
++        pc-&gt;sockaddr = bp-&gt;sockaddr;
++        pc-&gt;socklen = bp-&gt;socklen;
++        pc-&gt;name = &amp;bp-&gt;host;
++        bp-&gt;rrp.<span class="pl-smi">peers</span>-&gt;single = <span class="pl-c1">0</span>;
++
++        <span class="pl-k">if</span> (bp-&gt;more_tries) {
++            r-&gt;upstream-&gt;peer.<span class="pl-smi">tries</span> += bp-&gt;more_tries;
++        }
++
++        <span class="pl-c1">dd</span>(<span class="pl-s"><span class="pl-pds">"</span>tries: <span class="pl-c1">%d</span><span class="pl-pds">"</span></span>, (<span class="pl-k">int</span>) r-&gt;upstream-&gt;peer.<span class="pl-smi">tries</span>);
++
++        <span class="pl-k">return</span> NGX_OK;
++    }
++
++    <span class="pl-k">return</span> bp-&gt;<span class="pl-c1">get_rr_peer</span>(pc, &amp;bp-&gt;rrp);<span class="pl-c">//没有设置的话就采用round_robin的方式来获取</span>
++}
++</pre></div>
+
+<h1>
+<a id="欢迎一起交流学习-" class="anchor" href="#%E6%AC%A2%E8%BF%8E%E4%B8%80%E8%B5%B7%E4%BA%A4%E6%B5%81%E5%AD%A6%E4%B9%A0-" aria-hidden="true"><span class="octicon octicon-link"></span></a>欢迎一起交流学习 </h1>
+
+<p>在使用中有任何问题，欢迎反馈给我，可以用以下联系方式跟我交流</p>
+
+<ul>
+<li>邮件(1031379296#qq.com, 把#换成@)</li>
+<li>QQ: 1031379296</li>
+<li>weibo: <a href="http://weibo.com/u/2786211992/home">@王发康</a>
+</li>
+</ul>
+
+<h1>
+<a id="thx" class="anchor" href="#thx" aria-hidden="true"><span class="octicon octicon-link"></span></a>Thx</h1>
+
+<ul>
+<li>chunshengsterATgmail.com</li>
+</ul>
+
+<h1>
+<a id="author" class="anchor" href="#author" aria-hidden="true"><span class="octicon octicon-link"></span></a>Author</h1>
+
+<ul>
+<li>Linux\nginx\golang\c\c++爱好者</li>
+<li>欢迎一起交流  一起学习# </li>
+<li>Others say good and Others good</li>
+</ul>
+      </section>
+      <footer>
+        <p><small>Hosted on <a href="https://pages.github.com">GitHub Pages</a> using the Dinky theme</small></p>
+      </footer>
+    </div>
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+		          <script type="text/javascript">
+            var gaJsHost = (("https:" == document.location.protocol) ? "https://ssl." : "http://www.");
+            document.write(unescape("%3Cscript src='" + gaJsHost + "google-analytics.com/ga.js' type='text/javascript'%3E%3C/script%3E"));
+          </script>
+          <script type="text/javascript">
+            try {
+              var pageTracker = _gat._getTracker("balancer_by_lua  analysis");
+            pageTracker._trackPageview();
+            } catch(err) {}
+          </script>
+
+  </body>
+</html>
